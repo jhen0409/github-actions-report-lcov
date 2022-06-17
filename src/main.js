@@ -7,6 +7,8 @@ const lcovTotal = require("lcov-total");
 const os = require('os');
 const path = require('path');
 
+const events = ['pull_request', 'pull_request_target'];
+
 async function run() {
   try {
     await exec.exec('sudo apt-get install -y lcov');
@@ -15,6 +17,7 @@ async function run() {
     const coverageFilesPattern = core.getInput('coverage-files');
     const globber = await glob.create(coverageFilesPattern);
     const coverageFiles = await globber.glob();
+    const title = core.getInput('title');
 
     await genhtml(coverageFiles, tmpPath);
 
@@ -25,13 +28,20 @@ async function run() {
     const errorMessage = `The code coverage is too low. Expected at least ${minimumCoverage}.`;
     const isFailure = totalCoverage < minimumCoverage;
 
-    if (gitHubToken !== '' && github.context.eventName === 'pull_request') {
+    let prNumber = core.getInput('pr-number');
+    let sha = github.context.payload.after
+    if (!prNumber && events.includes(github.context.eventName)) {
+      prNumber = github.context.payload.pull_request.number
+      sha = github.context.payload.pull_request.head.sha
+    }
+    if (!sha) sha = github.context.sha
+
+    if (prNumber && gitHubToken !== '') {
       const octokit = await github.getOctokit(gitHubToken);
       const summary = await summarize(coverageFile);
-      const details = await detail(coverageFile, octokit);
-      const sha = github.context.payload.pull_request.head.sha;
+      const details = await detail(coverageFile, octokit, prNumber);
       const shaShort = sha.substr(0, 7);
-      let body = `### [LCOV](https://github.com/marketplace/actions/report-lcov) of commit [<code>${shaShort}</code>](${github.context.payload.pull_request.number}/commits/${sha}) during [${github.context.workflow} #${github.context.runNumber}](../actions/runs/${github.context.runId})\n<pre>${summary}\n\nFiles changed coverage rate:${details}</pre>`;
+      let body = `### ${title ?`${title} - ` : ''}[LCOV](https://github.com/marketplace/actions/report-lcov) of commit [<code>${shaShort}</code>](${prNumber}/commits/${sha}) during [${github.context.workflow} #${github.context.runNumber}](../actions/runs/${github.context.runId})\n<pre>${summary}\n\nFiles changed coverage rate:${details}</pre>`;
 
       if (isFailure) {
         body += `\n:no_entry: ${errorMessage}`;
@@ -40,7 +50,7 @@ async function run() {
       await octokit.issues.createComment({
         owner: github.context.repo.owner,
         repo: github.context.repo.repo,
-        issue_number: github.context.payload.pull_request.number,
+        issue_number: prNumber,
         body: body,
       });
     }
@@ -91,7 +101,7 @@ async function mergeCoverages(coverageFiles, tmpPath) {
   args.push('--output-file');
   args.push(mergedCoverageFile);
 
-  await exec.exec('lcov', args);
+  await exec.exec('lcov', [...args, '--rc', 'lcov_branch_coverage=1']);
 
   return mergedCoverageFile;
 }
@@ -112,6 +122,8 @@ async function summarize(coverageFile) {
   await exec.exec('lcov', [
     '--summary',
     coverageFile,
+    '--rc',
+    'lcov_branch_coverage=1'
   ], options);
 
   const lines = output
@@ -123,7 +135,7 @@ async function summarize(coverageFile) {
   return lines.join('\n');
 }
 
-async function detail(coverageFile, octokit) {
+async function detail(coverageFile, octokit, prNumber) {
   let output = '';
 
   const options = {};
@@ -140,6 +152,8 @@ async function detail(coverageFile, octokit) {
     '--list',
     coverageFile,
     '--list-full-path',
+    '--rc',
+    'lcov_branch_coverage=1',
   ], options);
 
   let lines = output
@@ -154,7 +168,7 @@ async function detail(coverageFile, octokit) {
     .pulls.listFiles.endpoint.merge({
       owner: github.context.repo.owner,
       repo: github.context.repo.repo,
-      pull_number: github.context.payload.pull_request.number,
+      pull_number: prNumber,
     });
   const listFilesResponse = await octokit.paginate(listFilesOptions);
   const changedFiles = listFilesResponse.map(file => file.filename);
